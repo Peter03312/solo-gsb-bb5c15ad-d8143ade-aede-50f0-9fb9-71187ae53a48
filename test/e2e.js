@@ -782,6 +782,229 @@ async function call(method, url, body) {
       '即席多站核验按站判定，无覆盖的站失格');
   })();
 
+  console.log('15) 授权报价组合预览（只读：最优组合 / 并列规则 / 缺口 / 拒绝 / 零写入）');
+  {
+    // 独立干净链：qRoot -> qSrc，root 全域授权，qSrc 无任何授权
+    const m1 = (await call('POST', '/api/materials', { title: '报价-成片', kind: 'video' })).data.id;
+    const m2 = (await call('POST', '/api/materials', { title: '报价-来源A', kind: 'audio' })).data.id;
+    const m3 = (await call('POST', '/api/materials', { title: '报价-来源B', kind: 'image' })).data.id;
+    await call('POST', `/api/materials/${m1}/sources`, { sourceMaterialId: m2, relation: '配乐' });
+    await call('POST', `/api/materials/${m1}/sources`, { sourceMaterialId: m3, relation: '画面' });
+    await call('POST', `/api/materials/${m1}/authorizations`, {
+      media: '*', region: '*', validFrom: '2026-01-01', validTo: '2030-12-31', licensor: 'r',
+    });
+    const basisBefore = (await call('GET', '/api/state')).data.basisVersion;
+    const authCountBefore = (await call('GET', '/api/state')).data.authorizationCount;
+
+    // 单站待发布包（10 月展期）：m2、m3 均缺授权
+    const pid = (await call('POST', '/api/packages', {
+      name: '报价预览包', medium: '屏幕放映', region: '中国大陆',
+      useFrom: '2026-10-01', useTo: '2026-11-30', materialIds: [m1],
+    })).data.id;
+
+    // 15.1 无报价 -> 无解，按站列出节点、现有原因与全部来源路径
+    let r = await call('POST', `/api/packages/${pid}/quotes/preview`, { quotes: [] });
+    ok(r.status === 200 && r.data.feasible === false, '无报价时预览 200 且无解');
+    ok(r.data.gaps.length === 1 && r.data.gaps[0].position === 0, '单站包按 1 站列出缺口');
+    const gapIds = r.data.gaps[0].nodes.map((n) => n.materialId).sort();
+    ok(gapIds.join() === `${m2},${m3}`, '缺口列出两个无授权来源节点');
+    const gapM2 = r.data.gaps[0].nodes.find((n) => n.materialId === m2);
+    ok(gapM2.existingReason === 'no_auth' && gapM2.noQuoteForNode === true
+       && gapM2.paths.some((p) => p.map((x) => x.materialId).join() === `${m1},${m2}`),
+      '缺口节点给出现有失格原因与全部来源路径');
+
+    // 15.2 报价补齐 -> 可行，总成本为两项之和；root 由现有授权覆盖
+    r = await call('POST', `/api/packages/${pid}/quotes/preview`, { quotes: [
+      { materialId: m2, media: '屏幕放映', region: '中国大陆', validFrom: '2026-10-01', validTo: '2026-11-30', cost: 100 },
+      { materialId: m3, media: '*', region: '*', validFrom: '2026-09-01', validTo: '2026-12-31', cost: 200 },
+    ] });
+    ok(r.status === 200 && r.data.feasible === true && r.data.totalCost === 300
+       && r.data.quoteCountSelected === 2, '两项报价补齐，总成本 300');
+    const rootCov = r.data.coverage[0].nodes.find((n) => n.materialId === m1);
+    const srcCov = r.data.coverage[0].nodes.find((n) => n.materialId === m2);
+    ok(rootCov.coveredBy.kind === 'existing' && srcCov.coveredBy.kind === 'quote' && srcCov.coveredBy.quoteIndex === 0,
+      '覆盖依据区分现有授权 / 所选报价');
+    ok(r.data.stats.existingCoveredCount === 1 && r.data.stats.requirementCount === 2, '需求统计：1 项现有覆盖、2 项报价补齐');
+
+    // 15.3 每个节点独立取最便宜候选（单站下一项报价只绑定一个素材节点，冗余贵报价落选）
+    r = await call('POST', `/api/packages/${pid}/quotes/preview`, { quotes: [
+      { materialId: m2, media: '*', region: '*', validFrom: '2026-01-01', validTo: '2030-12-31', cost: 100 },
+      { materialId: m2, media: '屏幕放映', region: '中国大陆', validFrom: '2026-10-01', validTo: '2026-11-30', cost: 150 },
+      { materialId: m3, media: '*', region: '*', validFrom: '2026-01-01', validTo: '2030-12-31', cost: 200 },
+      { materialId: m3, media: '屏幕放映', region: '中国大陆', validFrom: '2026-10-01', validTo: '2026-11-30', cost: 180 },
+    ] });
+    ok(r.data.feasible && r.data.totalCost === 280
+       && r.data.selectedQuotes.map((q) => q.index).join() === '0,3',
+       '各节点分别取最便宜候选：m2#0(100)+m3#3(180)=280，贵的冗余报价落选');
+
+    // 15.4 同成本同报价数：序号序列字典序最小
+    r = await call('POST', `/api/packages/${pid}/quotes/preview`, { quotes: [
+      { materialId: m2, media: '屏幕放映', region: '中国大陆', validFrom: '2026-10-01', validTo: '2026-11-30', cost: 100 }, // 0
+      { materialId: m2, media: '*', region: '*', validFrom: '2026-01-01', validTo: '2030-12-31', cost: 100 },               // 1
+      { materialId: m3, media: '*', region: '*', validFrom: '2026-01-01', validTo: '2030-12-31', cost: 200 },               // 2
+      { materialId: m3, media: '屏幕放映', region: '中国大陆', validFrom: '2026-10-01', validTo: '2026-11-30', cost: 200 }, // 3
+    ] });
+    ok(r.data.feasible && r.data.totalCost === 300
+       && r.data.selectedQuotes.map((q) => q.index).join() === '0,2',
+       '同成本同报价数取序号字典序最小 [0,2]');
+
+    // 15.5 短报价不可拼接：只覆盖半段的报价不能与现有/另一份拼接 -> 仍无解且列出 date 失配
+    r = await call('POST', `/api/packages/${pid}/quotes/preview`, { quotes: [
+      { materialId: m2, media: '屏幕放映', region: '中国大陆', validFrom: '2026-10-01', validTo: '2026-10-15', cost: 10 },
+      { materialId: m2, media: '屏幕放映', region: '中国大陆', validFrom: '2026-10-16', validTo: '2026-11-30', cost: 10 },
+      { materialId: m3, media: '*', region: '*', validFrom: '2026-09-01', validTo: '2026-12-31', cost: 5 },
+    ] });
+    ok(r.data.feasible === false, '两份半段短报价不能拼接，整包无解');
+    const m2gap = r.data.gaps.flatMap((g) => g.nodes).find((n) => n.materialId === m2);
+    ok(m2gap && m2gap.quoteFailures.every((f) => f.misses.includes('date')),
+       '各短报价均标注 date 失配（短报价不可拼接）');
+
+    // 15.6 媒介/地区不匹配的报价不构成候选
+    r = await call('POST', `/api/packages/${pid}/quotes/preview`, { quotes: [
+      { materialId: m2, media: '沉浸式投影', region: '中国大陆', validFrom: '2026-10-01', validTo: '2026-11-30', cost: 1 },
+      { materialId: m2, media: '屏幕放映', region: '中国香港', validFrom: '2026-10-01', validTo: '2026-11-30', cost: 1 },
+      { materialId: m3, media: '*', region: '*', validFrom: '2026-09-01', validTo: '2026-12-31', cost: 1 },
+    ] });
+    ok(r.data.feasible === false
+       && r.data.gaps.flatMap((g) => g.nodes).some((n) => n.materialId === m2),
+       '媒介 / 地区不匹配的报价不能覆盖该站节点');
+
+    // 15.7 输入非法逐行拒绝：不存在素材 / 缺字段 / 坏日期 / 成本非非负整数
+    r = await call('POST', `/api/packages/${pid}/quotes/preview`, { quotes: [
+      { materialId: 999999, media: '*', region: '*', validFrom: '2026-01-01', validTo: '2026-12-31', cost: 0 },
+      { materialId: m2, media: '', region: '*', validFrom: '2026-02-30', validTo: '2026-01-01', cost: -1 },
+      { materialId: m2, media: '*', region: '*', validFrom: '2026-01-01', validTo: '2026-12-31', cost: 2.5 },
+    ] });
+    ok(r.status === 400 && r.data.details.code === 'INVALID_QUOTES'
+       && r.data.details.errors.length === 3
+       && r.data.details.errors[0].messages.some((m) => m.includes('不存在'))
+       && r.data.details.errors[1].messages.some((m) => m.includes('媒介'))
+       && r.data.details.errors[2].messages.some((m) => m.includes('非负整数')),
+       '非法报价逐行说明原因并拒绝预览：' + JSON.stringify(r.data && r.data.details && r.data.details.code));
+
+    // 15.8 缺 quotes 字段
+    r = await call('POST', `/api/packages/${pid}/quotes/preview`, {});
+    ok(r.status === 400 && r.data.details.code === 'INVALID_QUOTES', '缺少 quotes 字段被拒');
+
+    // 15.9 零成本报价合法
+    r = await call('POST', `/api/packages/${pid}/quotes/preview`, { quotes: [
+      { materialId: m2, media: '*', region: '*', validFrom: '2026-01-01', validTo: '2030-12-31', cost: 0 },
+      { materialId: m3, media: '*', region: '*', validFrom: '2026-01-01', validTo: '2030-12-31', cost: 0 },
+    ] });
+    ok(r.data.feasible && r.data.totalCost === 0 && r.data.quoteCountSelected === 2, '成本 0 是非负整数，方案合法');
+
+    // 15.10 预览零写入：依据版本、授权数、包状态、快照数均不变
+    const st = await call('GET', '/api/state');
+    const pkgAfter = await call('GET', `/api/packages/${pid}`);
+    ok(st.data.basisVersion === basisBefore && st.data.authorizationCount === authCountBefore
+       && pkgAfter.data.status === 'draft'
+       && (pkgAfter.data.snapshots ? pkgAfter.data.snapshots.length : 0) === 0,
+       '报价预览不写入授权、包、状态或快照，依据版本不变');
+
+    // 15.11 已发布包不可预览
+    // 先补齐两节点授权，让包可发布
+    await call('POST', `/api/materials/${m2}/authorizations`, {
+      media: '*', region: '*', validFrom: '2026-01-01', validTo: '2030-12-31', licensor: 's2',
+    });
+    await call('POST', `/api/materials/${m3}/authorizations`, {
+      media: '*', region: '*', validFrom: '2026-01-01', validTo: '2030-12-31', licensor: 's3',
+    });
+    const v = await call('POST', '/api/verify', { packageId: pid });
+    const pub = await call('POST', `/api/packages/${pid}/publish`, { basisVersion: v.data.basisVersion });
+    ok(pub.status === 201, '前置：报价预览包已发布');
+    r = await call('POST', `/api/packages/${pid}/quotes/preview`, { quotes: [] });
+    ok(r.status === 409 && r.data.details.code === 'PACKAGE_PUBLISHED', '已发布包预览被拒 409 PACKAGE_PUBLISHED');
+
+    // 15.12 全部现有授权覆盖时，空报价方案可行、总成本 0
+    const pid2 = (await call('POST', '/api/packages', {
+      name: '报价全覆盖包', medium: '屏幕放映', region: '中国大陆',
+      useFrom: '2026-10-01', useTo: '2026-11-30', materialIds: [m1],
+    })).data.id;
+    r = await call('POST', `/api/packages/${pid2}/quotes/preview`, { quotes: [] });
+    ok(r.data.feasible === true && r.data.totalCost === 0 && r.data.quoteCountSelected === 0,
+       '现有授权全覆盖时无需任何报价，总成本 0');
+
+    // 15.13 不存在包 / 空包
+    ok((await call('POST', '/api/packages/999999/quotes/preview', { quotes: [] })).status === 404, '不存在的包 404');
+    const emptyP = (await call('POST', '/api/packages', {
+      name: '报价空包', medium: '屏幕放映', region: '中国大陆',
+      useFrom: '2026-10-01', useTo: '2026-11-30', materialIds: [],
+    })).data.id;
+    r = await call('POST', `/api/packages/${emptyP}/quotes/preview`, { quotes: [] });
+    ok(r.status === 400 && r.data.details.code === 'EMPTY_PACKAGE', '空包预览被拒 400 EMPTY_PACKAGE');
+  }
+
+  console.log('16) 多站报价预览：一份报价覆盖多站共享节点只算一次、按站缺口与并列规则')
+  {
+    const m1 = (await call('POST', '/api/materials', { title: '多站报价-成片', kind: 'video' })).data.id;
+    const m2 = (await call('POST', '/api/materials', { title: '多站报价-来源', kind: 'audio' })).data.id;
+    await call('POST', `/api/materials/${m1}/sources`, { sourceMaterialId: m2, relation: '配乐' });
+    await call('POST', `/api/materials/${m1}/authorizations`, {
+      media: '*', region: '*', validFrom: '2026-01-01', validTo: '2030-12-31', licensor: 'r',
+    });
+    // m2 仅北京站现有授权
+    await call('POST', `/api/materials/${m2}/authorizations`, {
+      media: '屏幕放映', region: '中国大陆', validFrom: '2026-03-01', validTo: '2026-03-31', licensor: 'bj',
+    });
+
+    const pid = (await call('POST', '/api/packages', {
+      name: '多站报价包', materialIds: [m1],
+      stops: [
+        { name: '北京站', medium: '屏幕放映', region: '中国大陆', useFrom: '2026-03-01', useTo: '2026-03-20' },
+        { name: '香港站', medium: '沉浸式投影', region: '中国香港', useFrom: '2026-05-01', useTo: '2026-05-20' },
+        { name: '上海站', medium: '屏幕放映', region: '中国大陆', useFrom: '2026-07-01', useTo: '2026-07-10' },
+      ],
+    })).data.id;
+
+    // 16.1 一份全域报价同时覆盖香港+上海：coverCount=2，费用只算一次；与两份同价时报价数少者胜
+    let r = await call('POST', `/api/packages/${pid}/quotes/preview`, { quotes: [
+      { materialId: m2, media: '*', region: '*', validFrom: '2026-01-01', validTo: '2030-12-31', cost: 200 },
+      { materialId: m2, media: '沉浸式投影', region: '中国香港', validFrom: '2026-05-01', validTo: '2026-05-31', cost: 100 },
+      { materialId: m2, media: '屏幕放映', region: '中国大陆', validFrom: '2026-07-01', validTo: '2026-07-31', cost: 100 },
+    ] });
+    ok(r.data.feasible && r.data.totalCost === 200 && r.data.quoteCountSelected === 1,
+       '同成本下一份全域报价（报价数少）胜，总成本 200');
+    const sel = r.data.selectedQuotes[0];
+    ok(sel.coverCount === 2
+       && sel.covers.map((c) => c.stopPosition).sort().join() === '1,2',
+       '共享节点两站需求由同一份报价覆盖，只核算一次');
+
+    // 16.2 全域 201 时两份 200 更便宜
+    r = await call('POST', `/api/packages/${pid}/quotes/preview`, { quotes: [
+      { materialId: m2, media: '*', region: '*', validFrom: '2026-01-01', validTo: '2030-12-31', cost: 201 },
+      { materialId: m2, media: '沉浸式投影', region: '中国香港', validFrom: '2026-05-01', validTo: '2026-05-31', cost: 100 },
+      { materialId: m2, media: '屏幕放映', region: '中国大陆', validFrom: '2026-07-01', validTo: '2026-07-31', cost: 100 },
+    ] });
+    ok(r.data.feasible && r.data.totalCost === 200 && r.data.selectedQuotes.map((q) => q.index).join() === '1,2',
+       '全域更贵时选两份单站报价（200 < 201）');
+
+    // 16.3 只给香港报价：无解且仅上海站列为缺口（北京由现有授权、香港由报价覆盖）
+    r = await call('POST', `/api/packages/${pid}/quotes/preview`, { quotes: [
+      { materialId: m2, media: '沉浸式投影', region: '中国香港', validFrom: '2026-05-01', validTo: '2026-05-31', cost: 100 },
+    ] });
+    ok(r.data.feasible === false && r.data.gaps.map((g) => g.position).join() === '2',
+       '仅仍无覆盖的上海站列为缺口（北京站现有授权、香港站报价已覆盖，均不列）');
+    ok(r.data.gaps.every((g) => g.nodes.every((n) => n.materialId === m2)), '缺口节点均为来源 m2 且带来源路径');
+
+    // 16.4 短报价：香港整段 05-01~05-20，报价只到 05-10 不可拼接 -> 香港仍缺
+    r = await call('POST', `/api/packages/${pid}/quotes/preview`, { quotes: [
+      { materialId: m2, media: '沉浸式投影', region: '中国香港', validFrom: '2026-05-01', validTo: '2026-05-10', cost: 1 },
+      { materialId: m2, media: '屏幕放映', region: '中国大陆', validFrom: '2026-07-01', validTo: '2026-07-31', cost: 100 },
+    ] });
+    ok(r.data.feasible === false
+       && r.data.gaps.some((g) => g.position === 1
+          && g.nodes[0].quoteFailures.some((f) => f.index === 0 && f.misses.includes('date'))),
+       '同站短报价不可拼接，香港站仍列缺口并标注 date');
+
+    // 16.5 报价 DTO 回显输入序号与全部字段；多站形态标记
+    r = await call('POST', `/api/packages/${pid}/quotes/preview`, { quotes: [
+      { materialId: m2, media: '*', region: '*', validFrom: '2026-01-01', validTo: '2030-12-31', cost: 200, licensor: '拟签约方', note: '打包' },
+    ] });
+    ok(r.data.multiStop === true && r.data.stopCount === 3
+       && r.data.request.quotes[0].index === 0 && r.data.request.quotes[0].licensor === '拟签约方',
+       '响应回显 multiStop/站数与报价输入序号、备注');
+  }
+
   console.log(`\n结果: ${pass} 通过, ${fail} 失败`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });

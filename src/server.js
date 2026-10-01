@@ -18,6 +18,7 @@ const {
 } = require('./verify');
 const { previewChange, commitChange, ChangeError } = require('./changes');
 const { searchSchedule, applySchedule, ScheduleError } = require('./schedule');
+const { previewQuotes, QuoteError } = require('./quotes');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -676,6 +677,14 @@ app.post('/api/changes/commit', (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ---------- 授权报价组合预览（只读；不写入授权、包、状态或快照，已发布包不可预览） ----------
+app.post('/api/packages/:id/quotes/preview', (req, res, next) => {
+  try {
+    const result = previewQuotes(db, Number(req.params.id), req.body || {});
+    res.json({ ok: true, ...result });
+  } catch (e) { next(e); }
+});
+
 // ---------- 快照 ----------
 app.get('/api/snapshots/:id', (req, res, next) => {
   try {
@@ -696,7 +705,7 @@ app.get('/api/snapshots/:id', (req, res, next) => {
 
 // ---------- 错误处理 ----------
 app.use((err, req, res, next) => {
-  if (err instanceof HttpError || err instanceof ChangeError || err instanceof ScheduleError) {
+  if (err instanceof HttpError || err instanceof ChangeError || err instanceof ScheduleError || err instanceof QuoteError) {
     return res.status(err.status).json({ error: err.message, details: err.details });
   }
   if (err && err.code === 'SQLITE_CONSTRAINT_TRIGGER') {
