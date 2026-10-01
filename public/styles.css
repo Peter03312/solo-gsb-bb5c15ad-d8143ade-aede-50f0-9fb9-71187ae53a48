@@ -133,3 +133,8 @@ pre.json { background: #0f172a; color: #dbeafe; padding: 12px; border-radius: 8p
 .stop-card.stop-bad { border: 1px solid #f0c9c5; background: #fdf3f2; }
 #stopsTable input { width: 100%; box-sizing: border-box; }
 #stopsTable td { vertical-align: middle; }
+
+/* 授权报价方案弹层 */
+#quotesTable input, #quotesTable select { width: 100%; box-sizing: border-box; }
+#quotesTable td { vertical-align: middle; }
+#quotesTable .q-cost { max-width: 90px; }

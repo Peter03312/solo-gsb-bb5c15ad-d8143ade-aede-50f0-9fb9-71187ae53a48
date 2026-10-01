@@ -707,6 +707,7 @@ function renderPackages() {
         <div class="pkg-actions">
           ${p.status === 'draft' ? `<button class="btn btn-small" data-act="edit">编辑</button>` : ''}
           ${p.status === 'draft' ? `<button class="btn btn-small btn-primary" data-act="to-verify">去核验</button>` : ''}
+          ${p.status === 'draft' || p.status === 'needs_review' ? `<button class="btn btn-small" data-act="quotes">授权报价方案</button>` : ''}
           ${p.status === 'draft' && !p.multiStop ? `<button class="btn btn-small" data-act="schedule">档期搜索</button>` : ''}
           ${p.status === 'draft' && p.multiStop ? '<span class="small-muted" title="档期搜索仅适用于单站包">多站行程在上方逐站编排（不支持整包档期搜索）</span>' : ''}
           ${p.status === 'needs_review' ? `<button class="btn btn-small btn-primary" data-act="recheck">重新核验（人工复核）</button>` : ''}
@@ -768,6 +769,8 @@ $('#packagesList').addEventListener('click', async (e) => {
       toast(r.message, !r.restored);
     } else if (btn.dataset.act === 'schedule') {
       await openScheduleSearch(id);
+    } else if (btn.dataset.act === 'quotes') {
+      await openQuotesPreview(id);
     } else if (btn.dataset.act === 'del') {
       if (!confirm('删除该待发布包？')) return;
       await api('DELETE', `/api/packages/${id}`);
@@ -776,6 +779,192 @@ $('#packagesList').addEventListener('click', async (e) => {
     }
   } catch (err) { toast(errText(err), true); }
 });
+
+// ---- 授权报价方案（只读预览）----
+let quotePreviewState = null; // { packageId, result }
+
+function quoteRowHtml(q = {}) {
+  const opts = ['<option value="">选择素材…</option>']
+    .concat(state.materials.map((m) =>
+      `<option value="${m.id}" ${q.materialId === m.id ? 'selected' : ''}>${esc(m.title)} #${m.id}</option>`))
+    .join('');
+  return `
+    <tr class="quote-row">
+      <td><select class="q-material">${opts}</select></td>
+      <td><input class="q-media" placeholder="屏幕放映 / *" value="${esc(q.media || '')}" /></td>
+      <td><input class="q-region" placeholder="中国大陆 / *" value="${esc(q.region || '')}" /></td>
+      <td><input class="q-from" type="date" value="${q.validFrom || ''}" /></td>
+      <td><input class="q-to" type="date" value="${q.validTo || ''}" /></td>
+      <td><input class="q-cost" type="number" min="0" step="1" placeholder="0" value="${q.cost !== undefined && q.cost !== null ? q.cost : ''}" /></td>
+      <td><input class="q-licensor" placeholder="授权方（可选）" value="${esc(q.licensor || '')}" /></td>
+      <td><button type="button" class="btn btn-small btn-danger" data-act="del-quote">删</button></td>
+    </tr>`;
+}
+
+function readQuoteRows() {
+  return $$('#quotesTable .quote-row').map((tr) => ({
+    materialId: Number(tr.querySelector('.q-material').value) || 0,
+    media: tr.querySelector('.q-media').value.trim(),
+    region: tr.querySelector('.q-region').value.trim(),
+    validFrom: tr.querySelector('.q-from').value,
+    validTo: tr.querySelector('.q-to').value,
+    cost: tr.querySelector('.q-cost').value === '' ? null : Number(tr.querySelector('.q-cost').value),
+    licensor: tr.querySelector('.q-licensor').value.trim(),
+  }));
+}
+
+function fillQuoteRows(quotes) {
+  const tbl = $('#quotesTable');
+  tbl.querySelectorAll('.quote-row').forEach((tr) => tr.remove());
+  (quotes && quotes.length ? quotes : [{}, {}]).forEach((q) => tbl.insertAdjacentHTML('beforeend', quoteRowHtml(q)));
+}
+
+async function openQuotesPreview(packageId) {
+  let pkg;
+  try {
+    pkg = await api('GET', `/api/packages/${packageId}`);
+  } catch (err) { toast(errText(err), true); return; }
+
+  $('#modalTitle').textContent = `授权报价方案预览：${pkg.name} #${pkg.id}`;
+  const stopSummary = pkg.multiStop
+    ? `多站巡展 ${pkg.stopCount} 站，整包共享素材 ${pkg.itemCount} 项（共享来源节点只核算一次；一份报价可覆盖多站）`
+    : `单站展：${pkg.medium} / ${pkg.region}，${pkg.useFrom} → ${pkg.useTo}，素材 ${pkg.itemCount} 项`;
+  $('#modalBody').innerHTML = `
+    <div class="edit-banner">
+      <span><b>${esc(stopSummary)}</b></span>
+      <span class="small-muted">状态：${STATUS_TEXT[pkg.status] || pkg.status} ｜ 预览为只读，不写入授权、包、状态或快照；已发布包不可预览</span>
+    </div>
+    <div class="pick-label">拟取得的授权报价（每项注明素材、媒介、地区、有效期与非负整数成本；同站短授权不可拼接）</div>
+    <table class="auth" id="quotesTable">
+      <tr><th>素材</th><th>媒介</th><th>地区</th><th>有效期起</th><th>有效期止</th><th>成本</th><th>授权方</th><th></th></tr>
+    </table>
+    <div class="mini" style="margin-top:6px">
+      <button type="button" class="btn btn-small" id="addQuoteRowBtn">＋ 添加一条报价</button>
+    </div>
+    <div class="pkg-actions" style="margin-top:8px">
+      <button class="btn btn-primary" id="runQuotePreviewBtn">生成最低成本方案预览</button>
+      <span class="small-muted">基于当前授权与来源关系计算；并列时报价数少者优先，再按输入序号取字典序最小</span>
+    </div>
+    <div id="quoteResult" class="schedule-result" style="margin-top:10px"></div>`;
+  const foot = $('#modalFoot');
+  foot.classList.remove('hidden');
+  foot.innerHTML = `<button class="btn" id="quotesClose">关闭</button>`;
+  $('#quotesClose').addEventListener('click', () => $('#modalBackdrop').classList.add('hidden'));
+  $('#modalBackdrop').classList.remove('hidden');
+
+  fillQuoteRows(quotePreviewState && quotePreviewState.packageId === packageId ? quotePreviewState.quotes : null);
+
+  $('#addQuoteRowBtn').addEventListener('click', () => {
+    $('#quotesTable').insertAdjacentHTML('beforeend', quoteRowHtml({}));
+  });
+  $('#quotesTable').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-act="del-quote"]');
+    if (!btn) return;
+    btn.closest('.quote-row').remove();
+  });
+  $('#runQuotePreviewBtn').addEventListener('click', async () => {
+    const quotes = readQuoteRows();
+    quotePreviewState = { packageId, quotes };
+    const box = $('#quoteResult');
+    box.innerHTML = '<div class="small-muted">计算中…</div>';
+    try {
+      const result = await api('POST', `/api/packages/${packageId}/quotes/preview`, {
+        quotes: quotes.filter((q) => q.materialId || q.media || q.validFrom || q.cost !== null),
+      });
+      renderQuoteResult(pkg, result);
+    } catch (err) {
+      let html = `<div class="errorline">${esc(errText(err))}</div>`;
+      if (err.details && Array.isArray(err.details.errors)) {
+        html += '<div class="section-title">已拒绝预览的原因（修正后可重新生成）</div>'
+          + err.details.errors.map((x) => `<div class="errorline">${esc(x.message)}</div>`).join('');
+      }
+      if (err.details && Array.isArray(err.details.itineraryErrors)) {
+        html += err.details.itineraryErrors.map((x) => `<div class="errorline">${esc(x)}</div>`).join('');
+      }
+      box.innerHTML = html;
+    }
+  });
+}
+
+function quoteCoverageCell(provider) {
+  if (!provider) return '<span class="pill pill-bad">缺口</span>';
+  if (provider.type === 'existing') {
+    return `<span class="pill pill-ok" title="现有有效授权 #${provider.authorizationId}">现有 #${provider.authorizationId}</span>`;
+  }
+  return `<span class="pill pill-warn" title="所选报价 #${provider.quoteIndex}">报价 #${provider.quoteIndex}</span>`;
+}
+
+function renderQuoteResult(pkg, r) {
+  const box = $('#quoteResult');
+  const verdict = r.feasible
+    ? `<div class="verdict pass">✓ 最低成本方案：再取得 <b>${r.selectedQuoteCount}</b> 条报价，总成本 <b>${r.totalCost}</b>（共享节点只核算一次；预览未写入任何数据）。
+         <span class="sub">共 ${r.stopCount} 站 · 来源链节点 ${r.stats.nodeCount} 个 · 现有授权覆盖 ${r.stats.existingCoveredNodeStopCount} 个“站×节点” · 报价覆盖 ${r.stats.quoteCoveredNodeStopCount} 个 · 依据版本 ${r.basisVersion}</span></div>`
+    : `<div class="verdict fail">✗ 现有授权与所录报价无法补全全部展期：仍有 <b>${r.stats.gapCount}</b> 个“站次 × 来源节点”缺口（预览未写入任何数据）。
+         <span class="sub">共 ${r.stopCount} 站 · 来源链节点 ${r.stats.nodeCount} 个 · 依据版本 ${r.basisVersion}；下方按站列出缺口节点、原因与全部来源路径</span></div>`;
+
+  const selectedTable = r.feasible ? `
+    <div class="section-title">选中的报价（${r.selectedQuotes.length} 条，总成本 ${r.totalCost}；一份报价可覆盖多站）</div>
+    <table class="auth">
+      <tr><th>#</th><th>素材</th><th>媒介</th><th>地区</th><th>有效期</th><th>成本</th><th>覆盖（站 × 节点）</th></tr>
+      ${r.selectedQuotes.map((q) => `
+        <tr>
+          <td>${q.index}</td>
+          <td>${esc(q.materialTitle)} <span class="small-muted">#${q.materialId}</span></td>
+          <td>${esc(q.media)}</td><td>${esc(q.region)}</td>
+          <td>${q.validFrom} → ${q.validTo}</td>
+          <td><b>${q.cost}</b></td>
+          <td>${q.covers.map((c) => `<span class="chip">第 ${c.stopPosition + 1} 站「${esc(c.stopName)}」× #${c.materialId}</span>`).join(' ')}</td>
+        </tr>`).join('')}
+    </table>` : '';
+
+  // 逐站 × 节点覆盖矩阵
+  const stopHeader = r.stops.map((s) => `<th>第 ${s.position + 1} 站<br/><span class="small-muted">${esc(s.name)} ${esc(s.medium)}/${esc(s.region)}<br/>${s.useFrom}→${s.useTo}</span></th>`).join('');
+  const matrix = `
+    <div class="section-title">各站来源链节点覆盖情况（现有授权 / 所选报价 / 缺口）</div>
+    <table class="auth">
+      <tr><th>节点</th>${stopHeader}${r.feasible ? '<th>本节点报价成本</th>' : ''}</tr>
+      ${r.nodes.map((n) => `
+        <tr>
+          <td>${esc(n.title)} <span class="small-muted">#${n.materialId}${n.isRoot ? '（入展品）' : ''}</span></td>
+          ${n.stops.map((p) => `<td>${quoteCoverageCell(p)}</td>`).join('')}
+          ${r.feasible ? `<td>${n.cost > 0 ? `<b>${n.cost}</b>` : '<span class="small-muted">0（现有授权已覆盖）</span>'}</td>` : ''}
+        </tr>`).join('')}
+    </table>`;
+
+  // 缺口按站分组
+  let gapsHtml = '';
+  if (!r.feasible) {
+    const byStop = new Map();
+    for (const g of r.gaps) {
+      if (!byStop.has(g.stopPosition)) byStop.set(g.stopPosition, []);
+      byStop.get(g.stopPosition).push(g);
+    }
+    gapsHtml = '<div class="section-title">仍缺授权的站次、节点与来源路径</div>' + [...byStop.keys()].sort((a, b) => a - b).map((sp) => {
+      const st = r.stops.find((x) => x.position === sp);
+      return `
+        <div class="card stop-card stop-bad" style="margin-top:6px">
+          <h3>第 ${sp + 1} 站：${esc(st.name)}
+            <span class="pill pill-bad">${byStop.get(sp).length} 个缺口节点</span>
+            <span class="small-muted">${esc(st.medium)} ｜ ${esc(st.region)} ｜ ${st.useFrom} → ${st.useTo}</span></h3>
+          ${byStop.get(sp).map((g) => `
+            <div style="margin:6px 0">
+              <b class="fail-node">${esc(g.title)}</b> <span class="small-muted">#${g.materialId}${g.isRoot ? '（入展品）' : ''}</span>
+              <div><span class="pill pill-bad">${esc(g.reasonText)}</span></div>
+              <div class="section-title">来源路径（共 ${g.paths.length} 条）</div>
+              ${g.paths.map((p) => '<div class="path">' + p.map((x, i) =>
+                (i ? ' → ' : '') + `<span class="${x.materialId === g.materialId ? 'fail-node' : ''}">${esc(x.title)}</span>`).join('') + '</div>').join('')}
+            </div>`).join('')}
+        </div>`;
+    }).join('');
+  }
+
+  const warningsHtml = r.warnings.length
+    ? `<div class="section-title">提示（${r.warnings.length}）</div>`
+      + r.warnings.map((w) => `<div class="small-muted">· ${esc(w.message)}</div>`).join('')
+    : '';
+
+  box.innerHTML = verdict + selectedTable + matrix + gapsHtml + warningsHtml;
+}
 
 // ---- 快照弹层 ----
 async function openSnapshot(snapshotId) {

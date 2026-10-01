@@ -637,6 +637,7 @@ module.exports = {
   loadGraph,
   findPath,
   collectChains,
+  evalNode,
   basisVersion,
   verifyPackage,
   verifyMultiStop,

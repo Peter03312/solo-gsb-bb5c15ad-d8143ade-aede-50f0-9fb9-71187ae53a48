@@ -4,6 +4,8 @@
 
 策展人还可为待发布包编排**多站巡展**：每站单独填写名称、展示媒介、地区及起止日期，按顺序展出（站间不得重叠，首尾日期均算占用），整包共享同一份入展素材清单。核验**逐站沿全部来源链**检查每个节点有一份未撤销授权独自覆盖该站整段展期——不同站可用不同授权，**同站不可拼接短授权**；发布在同一事务内重读行程、清单与授权依据，任一站失败则整包不发布。既有单站包的请求/响应完全兼容，旧包一律视为单站。
 
+策展人还可对待发布/需复核包**录入若干拟取得的授权报价**（素材、媒介、地区、有效期、非负整数成本），系统基于当前授权与来源关系，只读算出**总成本最低的报价组合**（共享节点只算一次、一份报价可覆盖多站、同站短授权不得拼接；并列时报价数少者优先，再按输入序号字典序），并在网页与 `POST /api/packages/:id/quotes/preview` 中展示方案或按站列出缺口与来源路径；预览不写入任何数据，已发布包不可预览。
+
 - 后端：Node.js 20 + Express + better-sqlite3（SQLite，同步事务）
 - 前端：原生 HTML/CSS/JS，无构建步骤
 - 交付：Dockerfile + docker-compose 一键启动，数据库自动初始化
@@ -52,7 +54,8 @@ npm start
 运行自检（需先启动服务）：
 
 ```bash
-node test/e2e.js
+node test/e2e.js          # 原有核验/发布/预演/档期/多站规则（148 项）
+node test/quotes-e2e.js   # 授权报价方案规则（52 项）
 ```
 
 ---
@@ -127,6 +130,17 @@ node test/e2e.js
 
 改期只更新待发布包的起止日期（展期天数保持不变），不发布、不写核验快照、不动清单；随后仍走既有「核验 → 发布」流程。
 
+### 拟取得授权报价方案（只读预览，为待发布/需复核包选最低成本报价组合）
+
+策展人可为**待发布或需复核**展览包录入若干「拟取得的授权报价」（每项注明**素材、媒介、地区、有效期和非负整数成本**），系统基于**同一份当前授权与来源关系**计算最低成本方案——全程**只读，不写入授权、包、状态或快照**；**已发布包不可预览**（请先「复制为待发布包」）。
+
+- 覆盖判定与核验完全一致：每站每个**入展素材及其全部来源节点**，须由一份**现有有效授权**或一份**所选报价独自覆盖该站整段展期**（未撤销、`*` 通配媒介/地区、忽略大小写、闭区间覆盖）；**共享来源节点只核算一次，一份报价可覆盖多站，同站短授权/短报价不得拼接**。
+- 各素材节点的报价彼此独立，逐节点解集合覆盖：先比**总成本最低**；总成本并列时取**报价数少者**；仍并列再按**输入序号序列**取**字典序最小**。
+- **有解**时给出：总成本、选中报价（按输入序号）及其覆盖的「站 × 节点」清单、逐站逐节点覆盖矩阵（现有授权 / 报价）、未入选报价的提示（无需取得 / 不能覆盖 / 不属本包）。
+- **无解**时列出仍缺授权的**站次、节点、原因（无报价 / 媒介不符 / 地区不符 / 日期不覆盖（短报价不可拼接））与该节点的全部来源路径**。
+- **拒绝预览（不落任何数据）并说明原因**：报价指向不存在的素材、字段缺失（媒介/地区）、日期非法或起止倒置、成本不是非负整数、报价数量超上限、空包、包行程非法或来源链无法完整核验（成环/超深/路径超限）、包已发布。
+- 需复核包同样可预览（用于估算补授权成本）；预览不改其状态、不追加快照。
+
 ---
 
 ## 四、核验规则要点
@@ -173,6 +187,7 @@ node test/e2e.js
 | `POST /api/verify` | 试核验（body 可传 `packageId`、单站完整字段，或 `{materialIds, stops[]}` 即席多站核验） |
 | `POST /api/packages/:id/schedule/search` | **档期搜索（仅单站）**：多站包返回 `409 MULTI_STOP_UNSUPPORTED` |
 | `POST /api/packages/:id/schedule/apply` | **选定档期改期（仅单站）**：多站包同样 `409 MULTI_STOP_UNSUPPORTED` |
+| `POST /api/packages/:id/quotes/preview` | **授权报价方案预览（只读）**：为待发布/需复核包计算最低成本报价组合；已发布包 `409 PUBLISHED_NO_PREVIEW` |
 | `POST /api/packages/:id/publish` | 发布，body 需含核验时的 `basisVersion`；事务内重读行程/清单/依据，过期 409、任一站不合格 422 |
 | `POST /api/packages/:id/recheck` | 对需复核包人工重新核验 |
 | `POST /api/changes/preview` | **变更影响预演**（只读）：单笔授权增改撤删 / 单条来源增删，返回将由合格转不合格的已发布包、问题节点、原因与依据版本 |
@@ -359,6 +374,74 @@ curl -s -X POST http://localhost:3000/api/packages/12/schedule/apply \
 
 > 注意：应用成功后 `searchToken` 即作废（包展期已变），需要再次改期请重新搜索。
 
+### 授权报价方案 API 调用示例（只读预览）
+
+为待发布/需复核包录入若干拟取得的授权报价（`cost` 为非负整数；字段语义与授权登记一致，`media` 兼容 `medium`），服务端基于当前授权与来源关系求解：
+
+```bash
+curl -s -X POST http://localhost:3000/api/packages/12/quotes/preview \
+  -H 'Content-Type: application/json' \
+  -d '{ "quotes": [
+    { "materialId": 4, "media": "*", "region": "*",
+      "validFrom": "2026-10-01", "validTo": "2026-11-30", "cost": 100, "licensor": "字库公司" },
+    { "materialId": 5, "media": "屏幕放映", "region": "中国大陆",
+      "validFrom": "2026-09-01", "validTo": "2026-12-31", "cost": 50 }
+  ]}'
+```
+
+有解（`feasible:true`）：
+
+```jsonc
+{ "ok": true, "readOnly": true, "mutated": false, "packageId": 12, "status": "draft",
+  "multiStop": false, "stopCount": 1, "basisVersion": 22, "quoteCount": 2,
+  "feasible": true, "totalCost": 150, "selectedQuoteCount": 2,
+  "selectedQuotes": [
+    { "index": 1, "materialId": 4, "materialTitle": "标题字体“展宋”",
+      "media": "*", "region": "*", "validFrom": "2026-10-01", "validTo": "2026-11-30",
+      "cost": 100, "covers": [ {"stopPosition": 0, "stopName": "临时展屏展包…", "materialId": 4} ],
+      "coveredStopCount": 1 },
+    { "index": 2, "materialId": 5, "cost": 50, "coveredStopCount": 1, "covers": [ … ] }
+  ],
+  "stats": { "nodeCount": 5, "existingCoveredNodeStopCount": 3,
+             "quoteCoveredNodeStopCount": 2, "gapCount": 0 },
+  // 逐节点逐站覆盖依据：stops[站] = 现有授权 {type:"existing",authorizationId,…}
+  //                     或所选报价 {type:"quote",quoteIndex,…}
+  "nodes": [ { "materialId": 1, "cost": 0, "covered": true, "stops": [ {"type":"existing", …} ] }, … ],
+  "gaps": [], "warnings": [] }
+```
+
+多站包中**一份报价覆盖多站**时，其成本只计一次，`covers` 会列出全部「站 × 节点」。
+
+无解（`feasible:false`，`totalCost:null`，`gaps` 按站次、节点列出）：
+
+```jsonc
+{ "feasible": false, "totalCost": null,
+  "gaps": [
+    { "stopPosition": 1, "stopName": "香港巡展", "medium": "沉浸式投影", "region": "中国香港",
+      "useFrom": "2026-05-01", "useTo": "2026-05-20",
+      "materialId": 7, "title": "多站-来源", "isRoot": false,
+      "reason": "date",
+      "reasonText": "该站：现有授权不覆盖；没有任何一份报价能独自覆盖该站整段展期（短报价不可拼接）",
+      "paths": [ [ {"materialId":6,"title":"多站-成片"}, {"materialId":7,"title":"多站-来源"} ] ] }
+  ] }
+```
+
+决胜规则：`totalCost` 最小；并列取 `selectedQuoteCount` 最小；仍并列按所选报价的**输入序号序列**字典序最小（如 `[2,4]` 优先于 `[2,5]`、`[3,4]`）。
+
+拒绝码（均为 4xx，且不产生任何写入，预览不改依据版本）：
+
+```text
+400  QUOTES_REQUIRED          缺少 quotes 数组（无报价请传 []）
+400  TOO_MANY_QUOTES          报价数量超过单次预览上限（200 条）
+400  QUOTE_INVALID            报价字段问题（details.errors 逐条列出）：
+                              指向不存在素材（details.materialIds）、缺媒介/地区、
+                              日期非法或起止倒置、成本不是非负整数
+400  EMPTY_PACKAGE            包未选取任何素材
+404                          展览包不存在
+409  PUBLISHED_NO_PREVIEW     已发布包不可预览（请复制为待发布包）
+422  UNVERIFIABLE             行程非法/站间重叠，或来源链成环、超深、路径数超安全上限
+```
+
 ## 八、目录结构
 
 ```
@@ -372,11 +455,14 @@ curl -s -X POST http://localhost:3000/api/packages/12/schedule/apply \
 │   ├── verify.js           # 来源链遍历、成环检测、单站/多站逐节点授权核验、发布后重算
 │   ├── schedule.js         # 档期规划（仅单站；多站包明确拒绝）：起始日折算/交集/合并、事务内重验改期
 │   ├── changes.js          # 单笔变更影响预演（回滚型事务模拟）与确认提交（多站影响按站给出）
-│   ├── server.js           # Express API（多站行程编排、发布事务、依据过期拒绝、/api/changes/preview|commit）
+│   ├── quotes.js           # 拟取得授权报价方案（只读）：逐节点集合覆盖精确求解（成本→报价数→序号字典序）
+│   ├── server.js           # Express API（多站行程编排、发布事务、依据过期拒绝、/api/changes/preview|commit、/quotes/preview）
 │   └── seed.js             # 演示数据
-├── public                  # 浏览器前端（无构建；含多站行程表格编辑器与按站结果渲染）
+├── public                  # 浏览器前端（无构建；含多站行程表格编辑器、按站结果渲染与报价方案弹层）
 │   ├── index.html
 │   ├── styles.css
 │   └── app.js
-└── test/e2e.js             # 端到端业务规则自检（148 项，含多站巡展 44 项）
+└── test
+    ├── e2e.js              # 端到端业务规则自检（148 项，含多站巡展 44 项）
+    └── quotes-e2e.js       # 授权报价方案自检（52 项：最低成本/多站共享/并列决胜/缺口/校验/只读）
 ```
